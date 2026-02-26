@@ -1,20 +1,44 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
+#include <ESPAsyncWebServer.h>
 #include "mcu_pin_map.hpp"
 #include "system_log.h"
 #include "system_ota.h"
 #include "system_wifi.h"
 #include "wifi_secret.hpp"
+#include "system_webpage_home.hpp"
 
 static Logger logMain("MAIN");
 static Logger logCmd("CMD");
 
 static SystemWifi* wifi = nullptr;
 static SystemOta* ota = nullptr;
+static AsyncWebServer* webServer = nullptr;
 static Adafruit_AHTX0 aht;
 
-static int SerialPrintWait = 2000; // TODO: move to preferences... It's the ms between updates
+static int SerialPrintWait = 99000; // TODO: move to preferences... It's the ms between updates
+
+struct TelemetrySnapshot {
+  float ampVoltageV = 0.0f;
+  float currentA = 0.0f;
+  float tempC = 0.0f;
+  float humidityPct = 0.0f;
+  bool ahtValid = false;
+  unsigned long lastSampleMs = 0;
+  uint32_t sampleCount = 0;
+  float mainLoopBusyPct = 0.0f;
+};
+
+static TelemetrySnapshot gTelemetry;
+
+void initialize_system_ota();
+void initialize_networking();
+void initialize_system_log();
+void initialize_web_server();
+void update_measurements();
+void update_main_loop_load_estimate(unsigned long loopStartUs);
+
 
 static void scanI2C() {
   Serial.println("I2C scan start");
@@ -108,6 +132,7 @@ void setup() {
   initialize_networking();
 
   logMain.info(wifi->ipString());
+  initialize_web_server();
 
   initialize_system_ota();
 
@@ -143,11 +168,62 @@ void initialize_system_log()
     SystemLogger::instance().begin(logCfg);
     SystemLogger::instance().setLevel(SystemLogger::DEBUG);
 }
+
+void initialize_web_server()
+{
+    webServer = new AsyncWebServer(80);
+
+    webServer->on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+      request->send(200, "text/html; charset=utf-8", kHomePageHtml);
+    });
+
+    webServer->on("/api/status", HTTP_GET, [](AsyncWebServerRequest* request) {
+      const uint32_t heapTotal = ESP.getHeapSize();
+      const uint32_t heapFree = ESP.getFreeHeap();
+      const uint32_t heapUsed = (heapTotal >= heapFree) ? (heapTotal - heapFree) : 0;
+      const uint32_t heapMinFree = ESP.getMinFreeHeap();
+      const uint32_t heapMaxAlloc = ESP.getMaxAllocHeap();
+      const uint32_t sketchUsed = ESP.getSketchSize();
+      const uint32_t sketchFreeSpace = ESP.getFreeSketchSpace();
+      const uint32_t sketchTotal = sketchUsed + sketchFreeSpace;
+      const float heapUsedPct = (heapTotal > 0) ? (100.0f * (float)heapUsed / (float)heapTotal) : 0.0f;
+      const float sketchUsedPct = (sketchTotal > 0) ? (100.0f * (float)sketchUsed / (float)sketchTotal) : 0.0f;
+
+      AsyncResponseStream* response = request->beginResponseStream("application/json");
+      response->printf("{");
+      response->printf("\"wifi_connected\":%s,", (wifi && wifi->isConnected()) ? "true" : "false");
+      response->printf("\"ip\":\"%s\",", (wifi && wifi->isConnected()) ? wifi->ipString() : "0.0.0.0");
+      response->printf("\"amp_voltage_v\":%.5f,", gTelemetry.ampVoltageV);
+      response->printf("\"current_a\":%.5f,", gTelemetry.currentA);
+      response->printf("\"aht_valid\":%s,", gTelemetry.ahtValid ? "true" : "false");
+      response->printf("\"temp_c\":%.3f,", gTelemetry.tempC);
+      response->printf("\"humidity_pct\":%.3f,", gTelemetry.humidityPct);
+      response->printf("\"sample_count\":%lu,", (unsigned long)gTelemetry.sampleCount);
+      response->printf("\"last_sample_ms\":%lu,", gTelemetry.lastSampleMs);
+      response->printf("\"uptime_s\":%lu,", millis() / 1000UL);
+      response->printf("\"cpu_mhz\":%u,", ESP.getCpuFreqMHz());
+      response->printf("\"main_loop_busy_pct\":%.2f,", gTelemetry.mainLoopBusyPct);
+      response->printf("\"heap_total\":%lu,", (unsigned long)heapTotal);
+      response->printf("\"heap_used\":%lu,", (unsigned long)heapUsed);
+      response->printf("\"heap_used_pct\":%.2f,", heapUsedPct);
+      response->printf("\"heap_min_free\":%lu,", (unsigned long)heapMinFree);
+      response->printf("\"heap_max_alloc\":%lu,", (unsigned long)heapMaxAlloc);
+      response->printf("\"sketch_used\":%lu,", (unsigned long)sketchUsed);
+      response->printf("\"sketch_total\":%lu,", (unsigned long)sketchTotal);
+      response->printf("\"sketch_used_pct\":%.2f", sketchUsedPct);
+      response->printf("}");
+      request->send(response);
+    });
+
+    webServer->begin();
+    logMain.info("web server started on port 80");
+}
+
 void get_ampReading() {
   float v = readVoltageAveraged(300);
-
-  // Convert to current using calibrated slope:
   float currentA = ((v - v0) * 1000.0f) / mv_per_a;
+  gTelemetry.ampVoltageV = v;
+  gTelemetry.currentA = currentA;
 
   Serial.print("Vout=");
   Serial.print(v, 4);
@@ -166,7 +242,56 @@ float readVoltageAveraged(int samples = 200) {
   return (raw * VCC) / (float)ADC_MAX;
 }
 
+void update_measurements() {
+  get_ampReading();
+
+  sensors_event_t humidity, temp;
+  if (aht.getEvent(&humidity, &temp)) {
+    gTelemetry.ahtValid = true;
+    gTelemetry.tempC = temp.temperature;
+    gTelemetry.humidityPct = humidity.relative_humidity;
+    logMain.debug("Temp: %.2f C, RH: %.2f %%", temp.temperature, humidity.relative_humidity);
+  } else {
+    gTelemetry.ahtValid = false;
+  }
+
+  gTelemetry.lastSampleMs = millis();
+  gTelemetry.sampleCount++;
+}
+
+void update_main_loop_load_estimate(unsigned long loopStartUs) {
+  static unsigned long lastLoopStartUs = 0;
+  static unsigned long windowStartUs = 0;
+  static uint64_t accumElapsedUs = 0;
+  static uint64_t accumBusyUs = 0;
+
+  const unsigned long loopEndUs = micros();
+  const unsigned long busyUs = loopEndUs - loopStartUs;
+
+  if (lastLoopStartUs != 0) {
+    accumElapsedUs += (uint32_t)(loopStartUs - lastLoopStartUs);
+  }
+  accumBusyUs += busyUs;
+
+  if (windowStartUs == 0) {
+    windowStartUs = loopStartUs;
+  }
+
+  if ((uint32_t)(loopEndUs - windowStartUs) >= 5000000UL && accumElapsedUs > 0) {
+    float pct = (100.0f * (float)accumBusyUs) / (float)accumElapsedUs;
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 100.0f) pct = 100.0f;
+    gTelemetry.mainLoopBusyPct = pct;
+    accumElapsedUs = 0;
+    accumBusyUs = 0;
+    windowStartUs = loopStartUs;
+  }
+
+  lastLoopStartUs = loopStartUs;
+}
+
 void loop() {
+  const unsigned long loopStartUs = micros();
   handleSerialCommands();
   if (wifi) {
     wifi->handle();
@@ -176,16 +301,8 @@ void loop() {
   }
   static unsigned long lastStep = 0; //
   if (millis() - lastStep >= SerialPrintWait) {
-    //TODO Get WCS Reading!
-    get_ampReading();
-
-    sensors_event_t humidity, temp;
-    if (aht.getEvent(&humidity, &temp)) {
-      logMain.debug("Temp: %.2f C, RH: %.2f %%", temp.temperature, humidity.relative_humidity);
-    } 
-    
+    update_measurements();
     lastStep = millis();    //finally update 
   }
-
-
+  update_main_loop_load_estimate(loopStartUs);
 }
