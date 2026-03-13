@@ -3,110 +3,81 @@
 #include <Adafruit_AHTX0.h>
 #include <ESPAsyncWebServer.h>
 #include "mcu_pin_map.hpp"
-#include "system_log.h"
-#include "system_ota.h"
-#include "system_wifi.h"
-#include "wifi_secret.hpp"
-#include "system_webpage_home.hpp"
+#include "app.h"
 
-static Logger logMain("MAIN");
-static Logger logCmd("CMD");
 
-static SystemWifi* wifi = nullptr;
-static SystemOta* ota = nullptr;
-static AsyncWebServer* webServer = nullptr;
-static Adafruit_AHTX0 aht;
+APPLICATION_STATUS_FLAGS gAppFlags;
+simpleParser<> ttycli(Serial);
+TaskHandle_t serialCommandMonitor_t = nullptr;
+TaskHandle_t telemetryMonitor_t = nullptr;
 
-static int SerialPrintWait = 99000; // TODO: move to preferences... It's the ms between updates
+TelemetrySnapshot gTelemetry;
+uint32_t gSerialPrintWaitMs = kDefaultSerialPrintWaitMs;
 
-struct TelemetrySnapshot {
-  float ampVoltageV = 0.0f;
-  float currentA = 0.0f;
-  float tempC = 0.0f;
-  float humidityPct = 0.0f;
-  bool ahtValid = false;
-  unsigned long lastSampleMs = 0;
-  uint32_t sampleCount = 0;
-  float mainLoopBusyPct = 0.0f;
+/*
+TODO: only output to stdout when flags set
+TODO: implement command to calibrate current sensor
+
+*/
+
+static constexpr TickType_t kTelemetryUpdateIntervalTicks = pdMS_TO_TICKS(500);
+
+namespace {
+enum class TankSensorPhase : uint8_t {
+  kDischarge,
+  kWaitForRise,
 };
 
-static TelemetrySnapshot gTelemetry;
+TankSensorPhase gTankSensorPhase = TankSensorPhase::kDischarge;
+unsigned long gTankSensorPhaseStartedUs = 0;
 
-void initialize_system_ota();
-void initialize_networking();
-void initialize_system_log();
-void initialize_web_server();
-void update_measurements();
-void update_main_loop_load_estimate(unsigned long loopStartUs);
+void serviceTankSensor() {
+  const unsigned long nowUs = micros();
 
-
-static void scanI2C() {
-  Serial.println("I2C scan start");
-  int found = 0;
-  for (uint8_t addr = 1; addr < 0x7F; ++addr) {
-    Wire.beginTransmission(addr);
-    uint8_t err = Wire.endTransmission();
-    if (err == 0) {
-      Serial.print("I2C device @ 0x");
-      if (addr < 16) {
-        Serial.print('0');
-      }
-      Serial.println(addr, HEX);
-      ++found;
-    }
+  if (gTankSensorPhaseStartedUs == 0) {
+    pinMode(WATER_LEVEL_SENSE_PIN, OUTPUT);
+    digitalWrite(WATER_LEVEL_SENSE_PIN, LOW);
+    gTankSensorPhaseStartedUs = nowUs;
+    return;
   }
-  if (found == 0) {
-    Serial.println("I2C scan: no devices");
-  }
-  Serial.println("I2C scan done");
-}
 
-static void handleSerialCommands() {
-  static String line;
-  while (Serial.available() > 0) {
-    char c = static_cast<char>(Serial.read());
-    if (c == '\n' || c == '\r') {
-      if (line.length() == 0) {
-        continue;
-      }
-      line.trim();
-      if (line.startsWith("log ")) {
-        String level = line.substring(4);
-        level.toUpperCase();
-        if (level == "TRACE") {
-          SystemLogger::instance().setLevel(SystemLogger::TRACE);
-        } else if (level == "DEBUG") {
-          SystemLogger::instance().setLevel(SystemLogger::DEBUG);
-        } else if (level == "INFO") {
-          SystemLogger::instance().setLevel(SystemLogger::INFO);
-        } else if (level == "WARN") {
-          SystemLogger::instance().setLevel(SystemLogger::WARN);
-        } else if (level == "ERROR") {
-          SystemLogger::instance().setLevel(SystemLogger::ERROR);
-        } else if (level == "FATAL") {
-          SystemLogger::instance().setLevel(SystemLogger::FATAL);
-        } else {
-          logCmd.warn("unknown level: %s", level.c_str());
-        }
-        logCmd.info("log level now %s", level.c_str());
-      } else if (line == "log?") {
-        logCmd.info("levels: TRACE DEBUG INFO WARN ERROR FATAL");
-      } else {
-        logCmd.warn("unknown cmd: %s", line.c_str());
-      }
-      line = "";
-    } else {
-      line += c;
+  if (gTankSensorPhase == TankSensorPhase::kDischarge) {
+    if ((uint32_t)(nowUs - gTankSensorPhaseStartedUs) < 10000UL) {
+      return;
     }
+
+    pinMode(WATER_LEVEL_SENSE_PIN, INPUT);
+    gTankSensorPhase = TankSensorPhase::kWaitForRise;
+    gTankSensorPhaseStartedUs = nowUs;
+    return;
+  }
+
+  if (digitalRead(WATER_LEVEL_SENSE_PIN) == HIGH) {
+    gTelemetry.tankLevelRaw = (int)(nowUs - gTankSensorPhaseStartedUs);
+    gTelemetry.tankLevelValid = true;
+    gTankSensorPhase = TankSensorPhase::kDischarge;
+    gTankSensorPhaseStartedUs = 0;
+    return;
+  }
+
+  if ((uint32_t)(nowUs - gTankSensorPhaseStartedUs) > 50000UL) {
+    Serial.println("ERROR: TIMEOUT Reading Tank Sensor");
+    gTelemetry.tankLevelRaw = -1;
+    gTelemetry.tankLevelValid = false;
+    gTankSensorPhase = TankSensorPhase::kDischarge;
+    gTankSensorPhaseStartedUs = 0;
   }
 }
+}
 
-static void initialize_mcu_pins() {
-  pinMode(AMP_SENSE_PIN, INPUT);
-  analogReadResolution(12);
-    #if defined(ESP32)
-      analogSetPinAttenuation(AMP_SENSE_PIN, ADC_11db);
-    #endif
+static void telemetryMonitorTask(void *pvParameters) {
+  (void)pvParameters;
+
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  for (;;) {
+    update_measurements();
+    vTaskDelayUntil(&lastWakeTime, kTelemetryUpdateIntervalTicks);
+  }
 }
 
 void setup() {
@@ -114,109 +85,92 @@ void setup() {
   while (!Serial) {
     delay(10);
   }
+  Serial.println("Loading System Prefs... ");
+  initialize_system_preferences();
+  Serial.println("Loaded System Prefs.");
+  loadSamplingPreferences();
 
+  Serial.println("Initializing log...");
   initialize_system_log();
+  Serial.println("Log initialized.");
 
+  Serial.println("Initializing networking...");
+  initialize_networking();
+  Serial.println("Networking initialized.");
+  Serial.print("IP: ");
+  Serial.println(wifi ? wifi->ipString() : "0.0.0.0");
   
+  Serial.println("Initializing web server...");
+  initialize_web_server();
+  Serial.println("Web server initialized.");
+  Serial.println("Initializing OTA...");
+  initialize_system_ota();
+  Serial.println("OTA initialized.");
+
+  Serial.println("Initializing I2C...");
   Wire.begin(i2cSdaPin, i2cSclPin);
   Wire.setClock(50000);
   Wire.setTimeOut(100);
+  Serial.println("I2C initialized.");
+  
+  Serial.println("Initializing MCU pins...");
+  initialize_mcu_pins();
+  Serial.println("MCU pins initialized.");
   
   delay(200);
+  Serial.println("Starting I2C scan...");
   scanI2C();
   delay(50);
+  Serial.println("Initializing AHT...");
   if (!aht.begin()) {
     logMain.error("AHT10 init failed");
   }
+  Serial.println("AHT init complete.");
 
-  initialize_networking();
+  Serial.println("Measuring v0...");
+  v0 = readVoltageAveraged(800);
+  Serial.print("Auto-zero v0=");
+  Serial.println(v0, 4);
 
-  logMain.info(wifi->ipString());
-  initialize_web_server();
+  logMain.info("serialCommandMonitor_t:: Starting");
+  
+  xTaskCreatePinnedToCore(
+    serialCommandMonitorTask,       /* Function to implement the task */
+    "serialCommandMonitor_t",       /* Name of the task */
+    10000,                          /* Stack size in words */
+    NULL,                           /* Task input parameter */
+    1,                              /* Priority of the task */
+    &serialCommandMonitor_t,        /* Task handle */
+    0);                             /* Core ID (0 or 1) */
 
-  initialize_system_ota();
+  logMain.info("serialCommandMonitor_t:: setup complete");
 
-  logMain.info("setup complete");
+  xTaskCreatePinnedToCore(
+    telemetryMonitorTask,
+    "telemetryMonitor_t",
+    8192,
+    NULL,
+    1,
+    &telemetryMonitor_t,
+    0);
+
+  logMain.info("SYSTEM INITIALIZED");
 }
 
-void initialize_system_ota()
-{
-    SystemOta::Config otaCfg;
-    otaCfg.hostname = "c3-mini";
-    ota = new SystemOta(otaCfg);
-    ota->begin();
-}
-
-void initialize_networking()
-{
-    SystemWifi::Config wifiCfg;
-    wifiCfg.ssid = kWifiSsid;
-    wifiCfg.password = kWifiPass;
-    wifi = new SystemWifi(wifiCfg);
-    wifi->setHostname("c3-mini");
-    wifi->begin();
-}
-
-void initialize_system_log()
-{
-    SystemLogger::Config logCfg;
-    logCfg.serialEnabled = true;
-    logCfg.fileEnabled = false;
-    logCfg.filePath = "/log.txt";
-    logCfg.maxFileBytes = 64 * 1024;
-    logCfg.timestamps = true;
-    SystemLogger::instance().begin(logCfg);
-    SystemLogger::instance().setLevel(SystemLogger::DEBUG);
-}
-
-void initialize_web_server()
-{
-    webServer = new AsyncWebServer(80);
-
-    webServer->on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
-      request->send(200, "text/html; charset=utf-8", kHomePageHtml);
-    });
-
-    webServer->on("/api/status", HTTP_GET, [](AsyncWebServerRequest* request) {
-      const uint32_t heapTotal = ESP.getHeapSize();
-      const uint32_t heapFree = ESP.getFreeHeap();
-      const uint32_t heapUsed = (heapTotal >= heapFree) ? (heapTotal - heapFree) : 0;
-      const uint32_t heapMinFree = ESP.getMinFreeHeap();
-      const uint32_t heapMaxAlloc = ESP.getMaxAllocHeap();
-      const uint32_t sketchUsed = ESP.getSketchSize();
-      const uint32_t sketchFreeSpace = ESP.getFreeSketchSpace();
-      const uint32_t sketchTotal = sketchUsed + sketchFreeSpace;
-      const float heapUsedPct = (heapTotal > 0) ? (100.0f * (float)heapUsed / (float)heapTotal) : 0.0f;
-      const float sketchUsedPct = (sketchTotal > 0) ? (100.0f * (float)sketchUsed / (float)sketchTotal) : 0.0f;
-
-      AsyncResponseStream* response = request->beginResponseStream("application/json");
-      response->printf("{");
-      response->printf("\"wifi_connected\":%s,", (wifi && wifi->isConnected()) ? "true" : "false");
-      response->printf("\"ip\":\"%s\",", (wifi && wifi->isConnected()) ? wifi->ipString() : "0.0.0.0");
-      response->printf("\"amp_voltage_v\":%.5f,", gTelemetry.ampVoltageV);
-      response->printf("\"current_a\":%.5f,", gTelemetry.currentA);
-      response->printf("\"aht_valid\":%s,", gTelemetry.ahtValid ? "true" : "false");
-      response->printf("\"temp_c\":%.3f,", gTelemetry.tempC);
-      response->printf("\"humidity_pct\":%.3f,", gTelemetry.humidityPct);
-      response->printf("\"sample_count\":%lu,", (unsigned long)gTelemetry.sampleCount);
-      response->printf("\"last_sample_ms\":%lu,", gTelemetry.lastSampleMs);
-      response->printf("\"uptime_s\":%lu,", millis() / 1000UL);
-      response->printf("\"cpu_mhz\":%u,", ESP.getCpuFreqMHz());
-      response->printf("\"main_loop_busy_pct\":%.2f,", gTelemetry.mainLoopBusyPct);
-      response->printf("\"heap_total\":%lu,", (unsigned long)heapTotal);
-      response->printf("\"heap_used\":%lu,", (unsigned long)heapUsed);
-      response->printf("\"heap_used_pct\":%.2f,", heapUsedPct);
-      response->printf("\"heap_min_free\":%lu,", (unsigned long)heapMinFree);
-      response->printf("\"heap_max_alloc\":%lu,", (unsigned long)heapMaxAlloc);
-      response->printf("\"sketch_used\":%lu,", (unsigned long)sketchUsed);
-      response->printf("\"sketch_total\":%lu,", (unsigned long)sketchTotal);
-      response->printf("\"sketch_used_pct\":%.2f", sketchUsedPct);
-      response->printf("}");
-      request->send(response);
-    });
-
-    webServer->begin();
-    logMain.info("web server started on port 80");
+void loop() {
+  const unsigned long loopStartUs = micros();
+  
+  if (wifi) {
+    wifi->handle();
+  }
+  if (ota) {
+    ota->handle();
+  }
+  serviceTankSensor();
+  update_main_loop_load_estimate(loopStartUs);  
+  // logMain.debug("MOWING: The Read... ");
+  //logMain.debug("Water Sensor: %d %%", read_tank_sensor(WATER_LEVEL_SENSE_PIN));
+  
 }
 
 void get_ampReading() {
@@ -249,8 +203,9 @@ void update_measurements() {
   if (aht.getEvent(&humidity, &temp)) {
     gTelemetry.ahtValid = true;
     gTelemetry.tempC = temp.temperature;
+    
     gTelemetry.humidityPct = humidity.relative_humidity;
-    logMain.debug("Temp: %.2f C, RH: %.2f %%", temp.temperature, humidity.relative_humidity);
+    //logMain.debug("Temp: %.2f C, RH: %.2f %%", temp.temperature, humidity.relative_humidity);
   } else {
     gTelemetry.ahtValid = false;
   }
@@ -288,21 +243,4 @@ void update_main_loop_load_estimate(unsigned long loopStartUs) {
   }
 
   lastLoopStartUs = loopStartUs;
-}
-
-void loop() {
-  const unsigned long loopStartUs = micros();
-  handleSerialCommands();
-  if (wifi) {
-    wifi->handle();
-  }
-  if (ota) {
-    ota->handle();
-  }
-  static unsigned long lastStep = 0; //
-  if (millis() - lastStep >= SerialPrintWait) {
-    update_measurements();
-    lastStep = millis();    //finally update 
-  }
-  update_main_loop_load_estimate(loopStartUs);
 }

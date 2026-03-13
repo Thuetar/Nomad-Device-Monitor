@@ -12,7 +12,6 @@ void SystemWifi::setConnectTimeoutMs(uint32_t ms) {
 
 void SystemWifi::applyNetworkConfig_() {
   if (cfg_.useDhcp) {
-    WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
     return;
   }
 
@@ -31,6 +30,7 @@ void SystemWifi::connect_() {
     return;
   }
 
+  Serial.println("SystemWifi: connect start");
   WiFi.mode(WIFI_STA);
   if (hostname_ && hostname_[0] != '\0') {
     WiFi.setHostname(hostname_);
@@ -38,12 +38,14 @@ void SystemWifi::connect_() {
   WiFi.setAutoReconnect(cfg_.autoReconnect);
   applyNetworkConfig_();
 
+  Serial.println("SystemWifi: calling WiFi.begin");
   WiFi.begin(cfg_.ssid, cfg_.password);
+  Serial.println("SystemWifi: WiFi.begin returned");
   const uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - start) < connectTimeoutMs_) {
     delay(100);
   }
-  
+  Serial.println("SystemWifi: WiFi.connect returned");
 }
 
 void SystemWifi::begin() {

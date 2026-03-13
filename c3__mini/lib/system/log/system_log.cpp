@@ -63,7 +63,10 @@ void SystemLogger::log_(Level level, const char* tag, const char* fmt, va_list a
   }
 
   char msg[kLineBufferSize];
-  vsnprintf(msg, sizeof(msg), fmt, args);
+  va_list argsCopy;
+  va_copy(argsCopy, args);
+  vsnprintf(msg, sizeof(msg), fmt, argsCopy);
+  va_end(argsCopy);
 
   char line[kLineBufferSize];
   if (cfg_.timestamps) {
@@ -83,8 +86,8 @@ void SystemLogger::log_(Level level, const char* tag, const char* fmt, va_list a
 }
 
 void SystemLogger::writeLine_(const char* line) {
-  if (cfg_.serialEnabled && cfg_.serial) {
-    cfg_.serial->println(line);
+  if (cfg_.serialEnabled) {
+    Serial.println(line);
   }
 
   if (!cfg_.fileEnabled || fs_ == nullptr) {
