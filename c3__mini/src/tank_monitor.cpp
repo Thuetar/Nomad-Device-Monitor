@@ -21,17 +21,15 @@ float clampPercent(float value) {
 }
 }  // namespace
 
-TankMonitor::TankMonitor() = default;
-
-void TankMonitor::begin() {
-  loadConfig();
+void TankMonitor::applyConfig(const TankSystemConfig& config) {
+  config_ = config;
   states_.assign(config_.sensors.size(), TankSensorState{});
   lastPollMs_ = 0;
   syncTelemetrySummary();
 }
 
 void TankMonitor::service() {
-  if (!config_.enabled) {
+  if (!config_.feature.enabled) {
     for (TankSensorState& state : states_) {
       state.status = SensorStatus::Offline;
       state.reading.valid = false;
@@ -41,7 +39,7 @@ void TankMonitor::service() {
   }
 
   const uint32_t now = millis();
-  if (lastPollMs_ != 0 && (now - lastPollMs_) < config_.pollIntervalMs) {
+  if (lastPollMs_ != 0 && (now - lastPollMs_) < config_.feature.pollIntervalMs) {
     return;
   }
 
@@ -55,6 +53,19 @@ void TankMonitor::forceRead() {
   service();
 }
 
+void TankMonitor::clearHistory(size_t index) {
+  if (index >= states_.size()) {
+    return;
+  }
+  states_[index].history = TankHistory{};
+}
+
+void TankMonitor::clearAllHistory() {
+  for (TankSensorState& state : states_) {
+    state.history = TankHistory{};
+  }
+}
+
 size_t TankMonitor::healthySensorCount() const {
   size_t count = 0;
   for (const TankSensorState& state : states_) {
@@ -65,34 +76,8 @@ size_t TankMonitor::healthySensorCount() const {
   return count;
 }
 
-void TankMonitor::loadDefaults() {
-  config_ = TankMonitorConfig{};
-
-  TankSensorConfig sensor;
-  sensor.id = "fresh_1";
-  sensor.customName = "Fresh Tank";
-  sensor.type = SensorType::Fresh;
-  sensor.enabled = true;
-  sensor.pin = WATER_LEVEL_SENSE_PIN;
-  sensor.capacityGallons = 40.0f;
-  sensor.calibration.emptyValue = 0;
-  sensor.calibration.fullValue = 0;
-  sensor.calibration.minValid = 0;
-  sensor.calibration.maxValid = 50000;
-  sensor.calibration.invert = false;
-  sensor.filter.enabled = true;
-  sensor.filter.emaAlpha = 0.25f;
-
-  config_.sensors.clear();
-  config_.sensors.push_back(sensor);
-}
-
-void TankMonitor::loadConfig() {
-  loadDefaults();
-}
-
 void TankMonitor::syncTelemetrySummary() {
-  gTelemetry.tankFeatureEnabled = config_.enabled;
+  gTelemetry.tankFeatureEnabled = config_.feature.enabled;
   gTelemetry.tankLastPollMs = lastPollMs_;
   gTelemetry.tankSensorCount = static_cast<uint8_t>(config_.sensors.size());
   gTelemetry.tankHealthySensorCount = static_cast<uint8_t>(healthySensorCount());
@@ -115,7 +100,6 @@ void TankMonitor::readSensor(size_t index) {
 
   const TankSensorConfig& cfg = config_.sensors[index];
   TankSensorState& state = states_[index];
-  state.history.samplesTaken++;
 
   if (!cfg.enabled) {
     state.status = SensorStatus::Offline;
@@ -132,6 +116,7 @@ void TankMonitor::readSensor(size_t index) {
   const int32_t raw = readRawSensor(cfg.pin);
   state.reading.lastReadMs = millis();
   state.reading.raw = raw;
+  state.history.samplesTaken++;
 
   if (!isRawValid(raw, cfg.calibration)) {
     state.status = SensorStatus::Fault;
@@ -146,7 +131,8 @@ void TankMonitor::readSensor(size_t index) {
   state.status = SensorStatus::Ok;
   state.reading.filtered = filteredPercent;
   state.reading.percent = filteredPercent;
-  state.reading.volumeGallons = computeVolumeGallons(filteredPercent, cfg.capacityGallons);
+  const float volumeCapacity = (cfg.usableCapacityGallons > 0.0f) ? cfg.usableCapacityGallons : cfg.capacityGallons;
+  state.reading.volumeGallons = computeVolumeGallons(filteredPercent, volumeCapacity);
   state.reading.valid = true;
   updateHistory(state);
 }
@@ -227,20 +213,6 @@ void TankMonitor::updateHistory(TankSensorState& state) {
   }
   if (state.history.samplesTaken <= 1 || state.reading.percent > state.history.highestPercent) {
     state.history.highestPercent = state.reading.percent;
-  }
-}
-
-const char* toString(SensorType value) {
-  switch (value) {
-    case SensorType::Fresh:
-      return "fresh";
-    case SensorType::Gray:
-      return "gray";
-    case SensorType::Black:
-      return "black";
-    case SensorType::Custom:
-    default:
-      return "custom";
   }
 }
 

@@ -5,7 +5,7 @@
 #include "targets/board_config.h"
 #include "core_system_globals.hpp"
 #include "app.h"
-#include "tank/tank_monitor.hpp"
+#include "tank/tank_service.hpp"
 
 
 
@@ -17,7 +17,7 @@ TaskHandle_t telemetryMonitor_t = nullptr;
 TelemetrySnapshot gTelemetry;
 uint32_t gSerialPrintWaitMs = kDefaultSerialPrintWaitMs;
 int touchpin1 = WATER_LEVEL_SENSE_PIN;
-overseer::feature::tank::TankMonitor* tankMonitor = nullptr;
+overseer::feature::tank::TankService* tankService = nullptr;
 
 /*
 TODO: only output to stdout when flags set
@@ -33,8 +33,8 @@ static void telemetryMonitorTask(void *pvParameters) {
   TickType_t lastWakeTime = xTaskGetTickCount();
   for (;;) {
     update_measurements();
-    if (tankMonitor) {
-      tankMonitor->service();
+    if (tankService) {
+      tankService->service();
     }
     vTaskDelayUntil(&lastWakeTime, kTelemetryUpdateIntervalTicks);
   }
@@ -74,8 +74,8 @@ void setup() {
   initialize_mcu_pins();
   Serial.println("MCU pins initialized.");
 
-  tankMonitor = new overseer::feature::tank::TankMonitor();
-  tankMonitor->begin();
+  tankService = new overseer::feature::tank::TankService();
+  tankService->begin();
 
   Serial.println("Initializing web server...");
   initialize_web_server();

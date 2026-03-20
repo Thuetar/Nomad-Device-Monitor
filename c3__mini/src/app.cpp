@@ -108,8 +108,8 @@ void initialize_web_server()
       request->send(response);
     });
 
-    if (tankMonitor) {
-      overseer::feature::tank::registerTankApi(*webServer, *tankMonitor);
+    if (tankService) {
+      overseer::feature::tank::registerTankApi(*webServer, *tankService);
     }
 
     webServer->begin();

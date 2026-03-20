@@ -4,8 +4,8 @@ class AsyncWebServer;
 
 namespace overseer::feature::tank {
 
-class TankMonitor;
+class TankService;
 
-void registerTankApi(AsyncWebServer& server, TankMonitor& monitor);
+void registerTankApi(AsyncWebServer& server, TankService& service);
 
 }  // namespace overseer::feature::tank

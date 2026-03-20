@@ -1,6 +1,7 @@
 #pragma once
 
-#include <Arduino.h>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "tank/tank_config.hpp"
@@ -39,37 +40,49 @@ struct TankSensorState {
 
 class TankMonitor {
 public:
-  void applyConfig(const TankSystemConfig& config);
-  void service();
-  void forceRead();
-  void clearHistory(size_t index);
-  void clearAllHistory();
+  void applyConfig(const TankSystemConfig& config) {
+    config_ = config;
+    states_.assign(config.sensors.size(), TankSensorState{});
+  }
+
+  void service() {}
+  void forceRead() {}
+
+  void clearHistory(size_t index) {
+    if (index < states_.size()) {
+      states_[index].history = TankHistory{};
+    }
+  }
+
+  void clearAllHistory() {
+    for (TankSensorState& state : states_) {
+      state.history = TankHistory{};
+    }
+  }
 
   const TankSystemConfig& config() const { return config_; }
   const std::vector<TankSensorState>& states() const { return states_; }
-
-  bool isEnabled() const { return config_.feature.enabled; }
+  size_t healthySensorCount() const { return 0; }
   size_t sensorCount() const { return config_.sensors.size(); }
-  size_t healthySensorCount() const;
-  uint32_t lastPollMs() const { return lastPollMs_; }
+  uint32_t lastPollMs() const { return 0; }
 
 private:
-  void syncTelemetrySummary();
-  void readAllSensors();
-  void readSensor(size_t index);
-  int32_t readRawSensor(uint8_t pin);
-  bool isCalibrationValid(const TankCalibrationConfig& calibration) const;
-  bool isRawValid(int32_t raw, const TankCalibrationConfig& calibration) const;
-  float scalePercent(int32_t raw, const TankCalibrationConfig& calibration) const;
-  float applyFilter(size_t index, float inputPercent);
-  float computeVolumeGallons(float percent, float capacityGallons) const;
-  void updateHistory(TankSensorState& state);
-
   TankSystemConfig config_;
   std::vector<TankSensorState> states_;
-  uint32_t lastPollMs_ = 0;
 };
 
-const char* toString(SensorStatus value);
+inline const char* toString(SensorStatus value) {
+  switch (value) {
+    case SensorStatus::Ok:
+      return "ok";
+    case SensorStatus::Fault:
+      return "fault";
+    case SensorStatus::Offline:
+      return "offline";
+    case SensorStatus::Uncalibrated:
+    default:
+      return "uncalibrated";
+  }
+}
 
 }  // namespace overseer::feature::tank

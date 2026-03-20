@@ -14,7 +14,7 @@
 #define APP_H
 
 namespace overseer::feature::tank {
-class TankMonitor;
+class TankService;
 }
 
 static constexpr uint32_t kDefaultSerialPrintWaitMs = 99000UL;
@@ -35,7 +35,7 @@ struct TelemetrySnapshot {
   float mainLoopBusyPct = 0.0f;
 };
 extern TelemetrySnapshot gTelemetry;
-extern overseer::feature::tank::TankMonitor* tankMonitor;
+extern overseer::feature::tank::TankService* tankService;
 
 extern struct APPLICATION_STATUS_FLAGS
 {
