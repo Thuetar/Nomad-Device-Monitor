@@ -2,8 +2,11 @@
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
 #include <ESPAsyncWebServer.h>
-#include "mcu_pin_map.hpp"
+#include "targets/board_config.h"
+#include "core_system_globals.hpp"
 #include "app.h"
+#include "tank/tank_monitor.hpp"
+
 
 
 APPLICATION_STATUS_FLAGS gAppFlags;
@@ -13,6 +16,8 @@ TaskHandle_t telemetryMonitor_t = nullptr;
 
 TelemetrySnapshot gTelemetry;
 uint32_t gSerialPrintWaitMs = kDefaultSerialPrintWaitMs;
+int touchpin1 = WATER_LEVEL_SENSE_PIN;
+overseer::feature::tank::TankMonitor* tankMonitor = nullptr;
 
 /*
 TODO: only output to stdout when flags set
@@ -20,55 +25,7 @@ TODO: implement command to calibrate current sensor
 
 */
 
-static constexpr TickType_t kTelemetryUpdateIntervalTicks = pdMS_TO_TICKS(500);
-
-namespace {
-enum class TankSensorPhase : uint8_t {
-  kDischarge,
-  kWaitForRise,
-};
-
-TankSensorPhase gTankSensorPhase = TankSensorPhase::kDischarge;
-unsigned long gTankSensorPhaseStartedUs = 0;
-
-void serviceTankSensor() {
-  const unsigned long nowUs = micros();
-
-  if (gTankSensorPhaseStartedUs == 0) {
-    pinMode(WATER_LEVEL_SENSE_PIN, OUTPUT);
-    digitalWrite(WATER_LEVEL_SENSE_PIN, LOW);
-    gTankSensorPhaseStartedUs = nowUs;
-    return;
-  }
-
-  if (gTankSensorPhase == TankSensorPhase::kDischarge) {
-    if ((uint32_t)(nowUs - gTankSensorPhaseStartedUs) < 10000UL) {
-      return;
-    }
-
-    pinMode(WATER_LEVEL_SENSE_PIN, INPUT);
-    gTankSensorPhase = TankSensorPhase::kWaitForRise;
-    gTankSensorPhaseStartedUs = nowUs;
-    return;
-  }
-
-  if (digitalRead(WATER_LEVEL_SENSE_PIN) == HIGH) {
-    gTelemetry.tankLevelRaw = (int)(nowUs - gTankSensorPhaseStartedUs);
-    gTelemetry.tankLevelValid = true;
-    gTankSensorPhase = TankSensorPhase::kDischarge;
-    gTankSensorPhaseStartedUs = 0;
-    return;
-  }
-
-  if ((uint32_t)(nowUs - gTankSensorPhaseStartedUs) > 50000UL) {
-    Serial.println("ERROR: TIMEOUT Reading Tank Sensor");
-    gTelemetry.tankLevelRaw = -1;
-    gTelemetry.tankLevelValid = false;
-    gTankSensorPhase = TankSensorPhase::kDischarge;
-    gTankSensorPhaseStartedUs = 0;
-  }
-}
-}
+static constexpr TickType_t kTelemetryUpdateIntervalTicks = pdMS_TO_TICKS(1000);
 
 static void telemetryMonitorTask(void *pvParameters) {
   (void)pvParameters;
@@ -76,6 +33,9 @@ static void telemetryMonitorTask(void *pvParameters) {
   TickType_t lastWakeTime = xTaskGetTickCount();
   for (;;) {
     update_measurements();
+    if (tankMonitor) {
+      tankMonitor->service();
+    }
     vTaskDelayUntil(&lastWakeTime, kTelemetryUpdateIntervalTicks);
   }
 }
@@ -100,9 +60,6 @@ void setup() {
   Serial.print("IP: ");
   Serial.println(wifi ? wifi->ipString() : "0.0.0.0");
   
-  Serial.println("Initializing web server...");
-  initialize_web_server();
-  Serial.println("Web server initialized.");
   Serial.println("Initializing OTA...");
   initialize_system_ota();
   Serial.println("OTA initialized.");
@@ -116,6 +73,13 @@ void setup() {
   Serial.println("Initializing MCU pins...");
   initialize_mcu_pins();
   Serial.println("MCU pins initialized.");
+
+  tankMonitor = new overseer::feature::tank::TankMonitor();
+  tankMonitor->begin();
+
+  Serial.println("Initializing web server...");
+  initialize_web_server();
+  Serial.println("Web server initialized.");
   
   delay(200);
   Serial.println("Starting I2C scan...");
@@ -166,26 +130,42 @@ void loop() {
   if (ota) {
     ota->handle();
   }
-  serviceTankSensor();
   update_main_loop_load_estimate(loopStartUs);  
-  // logMain.debug("MOWING: The Read... ");
-  //logMain.debug("Water Sensor: %d %%", read_tank_sensor(WATER_LEVEL_SENSE_PIN));
-  
+  // logMain.debug("MOWING: The Read... Started.");
+  // logMain.debug("Water Sensor: %d %%", read_tank_sensor(WATER_LEVEL_SENSE_PIN));
+  // const unsigned long nowUs = micros();
+  // pinMode(WATER_LEVEL_SENSE_PIN, OUTPUT);
+  // digitalWrite(WATER_LEVEL_SENSE_PIN, LOW);
+  // logMain.debug("MOWING: The Read... Now Low.");
+  // delay(100);
+  //Serial.println(touchRead(T2));  // get value using T2
+  //delay(1000);
+  //do {
+  //} while (digitalRead(pin) == LOW);
 }
 
 void get_ampReading() {
   float v = readVoltageAveraged(300);
   float currentA = ((v - v0) * 1000.0f) / mv_per_a;
+  v = (v - v0);
   gTelemetry.ampVoltageV = v;
   gTelemetry.currentA = currentA;
 
-  Serial.print("Vout=");
-  Serial.print(v, 4);
-  Serial.print(" V  |  I=");
-  Serial.print(currentA, 3);
-  Serial.println(" A");
+  // NewFunction(v, currentA);
 }
 
+void NewFunction(float v, float currentA)
+{
+    Serial.print("Vout=");
+    Serial.print(v, 4);
+    Serial.print(" V  |  I=");
+    Serial.print(currentA, 3);
+    Serial.println(" A");
+}
+
+/** @brief Low level function, gets raw data. 
+ *  @attention This returns the "Automagically CORRECTED" (i.e. raw - auto-correction_reading) voltage reading.
+ */
 float readVoltageAveraged(int samples = 200) {
   uint32_t sum = 0;
   for (int i = 0; i < samples; i++) {
@@ -193,7 +173,7 @@ float readVoltageAveraged(int samples = 200) {
     delayMicroseconds(200);
   }
   float raw = (float)sum / (float)samples;
-  return (raw * VCC) / (float)ADC_MAX;
+  return ( (raw * VCC) / (float)ADC_MAX );
 }
 
 void update_measurements() {

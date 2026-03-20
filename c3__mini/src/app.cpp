@@ -2,9 +2,9 @@
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
 #include <ESPAsyncWebServer.h>
-#include "mcu_pin_map.hpp"
 #include "app.h"
 #include <Preferences.h>
+#include "tank/tank_api.hpp"
 
 void initialize_mcu_pins() {
   //pinMode(AMP_SENSE_PIN, INPUT);
@@ -87,8 +87,10 @@ void initialize_web_server()
       response->printf("\"aht_valid\":%s,", gTelemetry.ahtValid ? "true" : "false");
       response->printf("\"temp_c\":%.3f,", gTelemetry.tempC);
       response->printf("\"humidity_pct\":%.3f,", gTelemetry.humidityPct);
-      response->printf("\"tank_level_raw\":%d,", gTelemetry.tankLevelRaw);
-      response->printf("\"tank_level_valid\":%s,", gTelemetry.tankLevelValid ? "true" : "false");
+      response->printf("\"tank_enabled\":%s,", gTelemetry.tankFeatureEnabled ? "true" : "false");
+      response->printf("\"tank_sensor_count\":%u,", gTelemetry.tankSensorCount);
+      response->printf("\"tank_healthy_sensor_count\":%u,", gTelemetry.tankHealthySensorCount);
+      response->printf("\"tank_last_poll_ms\":%lu,", (unsigned long)gTelemetry.tankLastPollMs);
       response->printf("\"sample_count\":%lu,", (unsigned long)gTelemetry.sampleCount);
       response->printf("\"last_sample_ms\":%lu,", gTelemetry.lastSampleMs);
       response->printf("\"uptime_s\":%lu,", millis() / 1000UL);
@@ -105,6 +107,10 @@ void initialize_web_server()
       response->printf("}");
       request->send(response);
     });
+
+    if (tankMonitor) {
+      overseer::feature::tank::registerTankApi(*webServer, *tankMonitor);
+    }
 
     webServer->begin();
     Serial.println("web server started on port 80");
@@ -175,8 +181,8 @@ void serialCommandMonitor() {
 
         Serial.printf(
           "\"wifi_connected\":%s,\"ip\":\"%s\",\"amp_voltage_v\":%.5f,\"current_a\":%.5f,"
-          "\"aht_valid\":%s,\"temp_c\":%.3f,\"humidity_pct\":%.3f,\"tank_level_raw\":%d,"
-          "\"tank_level_valid\":%s,\"sample_count\":%lu,"
+          "\"aht_valid\":%s,\"temp_c\":%.3f,\"humidity_pct\":%.3f,\"tank_enabled\":%s,"
+          "\"tank_sensor_count\":%u,\"tank_healthy_sensor_count\":%u,\"tank_last_poll_ms\":%lu,\"sample_count\":%lu,"
           "\"last_sample_ms\":%lu,\"uptime_s\":%lu,\"cpu_mhz\":%u,\"main_loop_busy_pct\":%.2f,"
           "\"heap_total\":%lu,\"heap_used\":%lu,\"heap_used_pct\":%.2f,\"heap_min_free\":%lu,"
           "\"heap_max_alloc\":%lu,\"sketch_used\":%lu,\"sketch_total\":%lu,\"sketch_used_pct\":%.2f}\n",
@@ -187,8 +193,10 @@ void serialCommandMonitor() {
           gTelemetry.ahtValid ? "true" : "false",
           gTelemetry.tempC,
           gTelemetry.humidityPct,
-          gTelemetry.tankLevelRaw,
-          gTelemetry.tankLevelValid ? "true" : "false",
+          gTelemetry.tankFeatureEnabled ? "true" : "false",
+          gTelemetry.tankSensorCount,
+          gTelemetry.tankHealthySensorCount,
+          (unsigned long)gTelemetry.tankLastPollMs,
           (unsigned long)gTelemetry.sampleCount,
           gTelemetry.lastSampleMs,
           millis() / 1000UL,
@@ -293,24 +301,6 @@ void scanI2C() {
     Serial.println("I2C scan: no devices");
   }
   Serial.println("I2C scan done");
-}
-
-int read_tank_sensor(int pin)
-{    
-  pinMode(WATER_LEVEL_SENSE_PIN, OUTPUT);
-  digitalWrite(pin, LOW);
-  delay(10);
-  pinMode(pin, INPUT);
-
-  const uint32_t start = micros();
-  while (digitalRead(pin) == LOW) {
-    if ((micros() - start) > 50000UL) {
-      return -1;
-    }
-    delayMicroseconds(50);
-  }
-
-  return (micros() - start);
 }
 
 void initialize_system_preferences() {

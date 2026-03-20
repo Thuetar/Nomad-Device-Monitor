@@ -60,7 +60,9 @@ static const char kHomePageHtml[] PROGMEM = R"HTML(
       <div class="card"><div class="label">Heap Usage</div><div class="value" id="heap">-</div></div>
       <div class="card"><div class="label">Heap Min / MaxAlloc</div><div class="value" id="heap2">-</div></div>
       <div class="card"><div class="label">Sketch Usage</div><div class="value" id="flash">-</div></div>
+      <div class="card"><div class="label">Tank Feature</div><div class="value" id="tankSummary">-</div></div>
     </div>
+    <div class="grid" id="tankGrid"></div>
     <div class="footer" id="meta">Loading...</div>
   </div>
   <script>
@@ -85,6 +87,12 @@ static const char kHomePageHtml[] PROGMEM = R"HTML(
       return (d ? `${d}d ` : '') + `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
     }
 
+    function fmtNumber(n, suffix = '') {
+      if (!Number.isFinite(n)) return '-';
+      const text = Number(n).toFixed(2).replace(/\.?0+$/, '');
+      return suffix ? `${text} ${suffix}` : text;
+    }
+
     function updateCountdown() {
       if (!nextRefreshAt) { els.nextRefresh.textContent = '-'; return; }
       const sec = Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000));
@@ -96,36 +104,77 @@ static const char kHomePageHtml[] PROGMEM = R"HTML(
       const secs = Math.max(5, Math.min(60, Number(els.refreshSec.value) || 30));
       const ms = secs * 1000;
       nextRefreshAt = Date.now() + ms;
-      timerId = setTimeout(fetchStatus, ms);
+      timerId = setTimeout(refreshAll, ms);
       updateCountdown();
+    }
+
+    async function refreshAll() {
+      await Promise.all([fetchStatus(), fetchTank()]);
     }
 
     async function fetchStatus() {
       try {
         const res = await fetch('/api/status', { cache: 'no-store' });
         const d = await res.json();
-        els.currentA.textContent = `${d.current_a.toFixed(3)} A`;
-        els.ampVoltageV.textContent = `${d.amp_voltage_v.toFixed(4)} V`;
-        els.tempC.textContent = d.aht_valid ? `${d.temp_c.toFixed(2)} C` : 'AHT unavailable';
-        els.humidityPct.textContent = d.aht_valid ? `${d.humidity_pct.toFixed(2)} %` : 'AHT unavailable';
+        els.currentA.textContent = `${fmtNumber(d.current_a)} A`;
+        els.ampVoltageV.textContent = `${fmtNumber(d.amp_voltage_v)} V`;
+        els.tempC.textContent = d.aht_valid ? `${fmtNumber(d.temp_c)} C` : 'AHT unavailable';
+        els.humidityPct.textContent = d.aht_valid ? `${fmtNumber(d.humidity_pct)} %` : 'AHT unavailable';
         els.wifi.textContent = `${d.wifi_connected ? 'Connected' : 'Disconnected'} / ${d.ip}`;
         els.uptime.textContent = fmtDuration(d.uptime_s);
-        els.cpu.textContent = `${d.cpu_mhz} MHz | loop busy ${d.main_loop_busy_pct.toFixed(1)}%`;
-        els.heap.textContent = `${fmtBytes(d.heap_used)} / ${fmtBytes(d.heap_total)} (${d.heap_used_pct.toFixed(1)}%)`;
+        els.cpu.textContent = `${d.cpu_mhz} MHz | loop busy ${fmtNumber(d.main_loop_busy_pct)}%`;
+        els.heap.textContent = `${fmtBytes(d.heap_used)} / ${fmtBytes(d.heap_total)} (${fmtNumber(d.heap_used_pct)}%)`;
         els.heap2.textContent = `min free ${fmtBytes(d.heap_min_free)} | max alloc ${fmtBytes(d.heap_max_alloc)}`;
-        els.flash.textContent = `${fmtBytes(d.sketch_used)} / ${fmtBytes(d.sketch_total)} (${d.sketch_used_pct.toFixed(1)}%)`;
+        els.flash.textContent = `${fmtBytes(d.sketch_used)} / ${fmtBytes(d.sketch_total)} (${fmtNumber(d.sketch_used_pct)}%)`;
+        els.tankSummary.textContent = d.tank_enabled
+          ? `${d.tank_healthy_sensor_count}/${d.tank_sensor_count} healthy`
+          : 'Disabled';
         els.meta.textContent = `Samples: ${d.sample_count} | Last sample: ${d.last_sample_ms} ms | Updated: ${new Date().toLocaleString()}`;
       } catch (e) {
         els.meta.textContent = `Refresh error: ${e}`;
+      }
+    }
+
+    function renderTankCards(data) {
+      const sensors = Array.isArray(data.sensors) ? data.sensors : [];
+      if (!sensors.length) {
+        els.tankGrid.innerHTML = '';
+        return;
+      }
+
+      els.tankGrid.innerHTML = sensors.map(sensor => {
+        const reading = sensor.reading || {};
+        const updated = Number.isFinite(reading.last_read_ms)
+          ? `${fmtNumber(reading.last_read_ms)} ms`
+          : '-';
+        return `
+          <div class="card">
+            <div class="label">${sensor.custom_name || sensor.type || 'Tank Sensor'}</div>
+            <div class="value">${reading.valid ? `${fmtNumber(reading.percent)} %` : sensor.status}</div>
+            <div class="footer">
+              ${sensor.type} | ${fmtNumber(reading.volume_gallons)} gal | raw ${fmtNumber(reading.raw)} | filtered ${fmtNumber(reading.filtered)} | updated ${updated}
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function fetchTank() {
+      try {
+        const res = await fetch('/api/tank', { cache: 'no-store' });
+        const d = await res.json();
+        renderTankCards(d);
+      } catch (e) {
+        els.tankGrid.innerHTML = `<div class="card"><div class="label">Tank Monitor</div><div class="value warn">Unavailable</div><div class="footer">${e}</div></div>`;
       } finally {
         scheduleRefresh();
       }
     }
 
     els.refreshSec.addEventListener('change', scheduleRefresh);
-    els.refreshNow.addEventListener('click', fetchStatus);
+    els.refreshNow.addEventListener('click', refreshAll);
     setInterval(updateCountdown, 1000);
-    fetchStatus();
+    refreshAll();
   </script>
 </body>
 </html>

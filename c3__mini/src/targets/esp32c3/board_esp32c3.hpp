@@ -1,3 +1,5 @@
+#ifndef BOARD_ESP32C3_HPP
+#define BOARD_ESP32C3_HPP
 
 /*
 ESP32-C3-DevKitM-1
@@ -33,19 +35,4 @@ static float mv_per_a = 66.0f;         // placeholder; you MUST calibrate your b
 
 
 
-
-
-//Prototypes
-//void fuel_Motor_Control();
-//void fuelMotorEnablePIN(bool value);
-void serialCommandMonitor();                // -- Serial Command Handler
-float readVoltageAveraged(int);
-//STRING SHIZ
-#define xstr(s) str(s)
-#define str(s) #s
-#define SHOWSYM(a) do {sprintf(spbuffer, PSTR("Value of '" #a "' is %ld\n"), (long)a); Serial.print(spbuffer); } while (0)
-#define SHOWSYMS(a) do {sprintf(spbuffer, PSTR("Value of '" #a "' is '" a "'\n")); Serial.print(spbuffer); } while (0)
-#define mySerial Serial
-
-//uint32_t start, stop; //temp code timing -- shit code include... TODO: REFACTOR
-//float temp = 0;
+#endif // BOARD_ESP32C3_HPP
